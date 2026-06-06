@@ -1,0 +1,690 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+```
+
+---
+
+# Overview
+
+This report applies a probabilistic modeling framework to predict every game of the NCAA Tournament. Win probabilities are estimated using a logistic function applied to adjusted efficiency margins (AdjEM = AdjO − AdjDef). The tournament is then simulated 100,000 times via Monte Carlo methods to estimate each team's probability of advancing through every round.
+
+---
+
+# Data
+
+```{r load-data}
+stats <- read_csv("stats_MOH.csv", show_col_types = FALSE) %>%
+  mutate(adj_em = adj_off - adj_def)
+
+bracket <- read_csv("bracket_MOH.csv", show_col_types = FALSE)
+
+# Merge
+teams <- bracket %>%
+  left_join(stats, by = "team") %>%
+  arrange(region, slot)
+```
+
+```{r show-teams}
+teams %>%
+  select(Region = region, Seed = seed, Team = team, AdjO = adj_off, AdjDef = adj_def, AdjEM = adj_em) %>%
+  arrange(Region, Seed) %>%
+  kable(caption = "All 64 Tournament Teams with Efficiency Ratings", digits = 1) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+---
+
+# Probabilistic Model
+
+Win probability follows a logistic function on the efficiency margin difference:
+
+$$P(\text{win}) = \frac{1}{1 + \exp(-(E_1 - E_2) / \sigma)}$$
+
+where $\sigma$ is a scaling parameter calibrated to historical NCAA tournament data. We use $\sigma = 10$, which is consistent with published estimates from KenPom-based models.
+
+```{r win-prob-function}
+sigma <- 10
+
+win_prob <- function(em1, em2, sigma = 10) {
+  1 / (1 + exp(-(em1 - em2) / sigma))
+}
+```
+
+## Win Probability Preview
+
+```{r prob-preview}
+# Show win probs for representative seed matchups
+seed_matchups <- tibble(
+  Matchup = c("1 vs 16", "2 vs 15", "3 vs 14", "4 vs 13",
+              "5 vs 12", "6 vs 11", "7 vs 10", "8 vs 9"),
+  Higher_seed_EM = c(
+    mean(filter(teams, seed == 1)$adj_em),
+    mean(filter(teams, seed == 2)$adj_em),
+    mean(filter(teams, seed == 3)$adj_em),
+    mean(filter(teams, seed == 4)$adj_em),
+    mean(filter(teams, seed == 5)$adj_em),
+    mean(filter(teams, seed == 6)$adj_em),
+    mean(filter(teams, seed == 7)$adj_em),
+    mean(filter(teams, seed == 8)$adj_em)
+  ),
+  Lower_seed_EM = c(
+    mean(filter(teams, seed == 16)$adj_em),
+    mean(filter(teams, seed == 15)$adj_em),
+    mean(filter(teams, seed == 14)$adj_em),
+    mean(filter(teams, seed == 13)$adj_em),
+    mean(filter(teams, seed == 12)$adj_em),
+    mean(filter(teams, seed == 11)$adj_em),
+    mean(filter(teams, seed == 10)$adj_em),
+    mean(filter(teams, seed == 9)$adj_em)
+  )
+) %>%
+  mutate(
+    Win_Prob_Higher = round(win_prob(Higher_seed_EM, Lower_seed_EM) * 100, 1),
+    Historical_Upset_Rate = c(NA, 7, 15, 21, 35, 37, 40, 50)
+  )
+
+seed_matchups %>%
+  select(Matchup, `Model P(Higher Seed Wins)` = Win_Prob_Higher,
+         `Historical Upset Rate (%)` = Historical_Upset_Rate) %>%
+  kable(caption = "Model Win Probabilities vs. Historical Upset Rates") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# Monte Carlo Simulation
+
+The tournament bracket is structured with 4 regions of 16 teams. Within each region, the standard NCAA slot pairing applies:
+
+- Round of 64: (1v16), (8v9), (5v12), (4v13), (6v11), (3v14), (7v10), (2v15)
+- Winners advance through region to a Final Four
+- Final Four: East vs. West, South vs. Midwest (semifinal pairings)
+- Championship: Final Four winners meet
+
+```{r simulate-region}
+# ── Fast lookup: named vector of AdjEM, indexed by team name ──────────────────
+em_vec <- setNames(teams$adj_em, teams$team)
+
+# Slot-based bracket pairing for a region (16 teams, slots 1–16)
+get_round64_pairs <- function(region_teams) {
+  slot_order <- region_teams %>% arrange(slot)
+  pairs <- list(
+    c(1, 2),   # 1 vs 16
+    c(3, 4),   # 8 vs 9
+    c(5, 6),   # 5 vs 12
+    c(7, 8),   # 4 vs 13
+    c(9, 10),  # 6 vs 11
+    c(11, 12), # 3 vs 14
+    c(13, 14), # 7 vs 10
+    c(15, 16)  # 2 vs 15
+  )
+  lapply(pairs, function(p) slot_order$team[p])
+}
+
+# ── O(1) game simulation using pre-built named vector ─────────────────────────
+sim_game_fast <- function(t1, t2) {
+  p1 <- 1 / (1 + exp(-(em_vec[t1] - em_vec[t2]) / 10))
+  if (runif(1) < p1) t1 else t2
+}
+
+# ── Simulate one region, returns advancement vectors (not lists) ───────────────
+simulate_region_fast <- function(region_slots) {
+  # region_slots: character vector of 16 team names in slot order
+  
+  # R64 — 8 games
+  r32 <- c(
+    sim_game_fast(region_slots[1],  region_slots[2]),
+    sim_game_fast(region_slots[3],  region_slots[4]),
+    sim_game_fast(region_slots[5],  region_slots[6]),
+    sim_game_fast(region_slots[7],  region_slots[8]),
+    sim_game_fast(region_slots[9],  region_slots[10]),
+    sim_game_fast(region_slots[11], region_slots[12]),
+    sim_game_fast(region_slots[13], region_slots[14]),
+    sim_game_fast(region_slots[15], region_slots[16])
+  )
+  # R32 — 4 games
+  s16 <- c(
+    sim_game_fast(r32[1], r32[2]),
+    sim_game_fast(r32[3], r32[4]),
+    sim_game_fast(r32[5], r32[6]),
+    sim_game_fast(r32[7], r32[8])
+  )
+  # Sweet 16 — 2 games
+  e8 <- c(
+    sim_game_fast(s16[1], s16[2]),
+    sim_game_fast(s16[3], s16[4])
+  )
+  # Elite Eight — 1 game
+  champ <- sim_game_fast(e8[1], e8[2])
+  
+  list(r32 = r32, s16 = s16, e8 = e8, champ = champ)
+}
+
+# ── Pre-extract slot vectors for each region (done once, outside the loop) ────
+region_slots <- lapply(c("East","South","West","Midwest"), function(r) {
+  teams %>% filter(region == r) %>% arrange(slot) %>% pull(team)
+})
+names(region_slots) <- c("East","South","West","Midwest")
+
+# Keep get_round64_pairs available for display sections below
+```
+
+```{r run-simulations}
+set.seed(42)
+n_sims <- 100000
+
+all_teams <- teams$team
+n_teams   <- length(all_teams)
+
+# Integer accumulator matrix — rows = teams, cols = rounds
+adv_mat <- matrix(0L, nrow = n_teams, ncol = 6,
+                  dimnames = list(all_teams,
+                                  c("round32","sweet16","elite8","final4","finals","champion")))
+
+# ── Main simulation loop ───────────────────────────────────────────────────────
+for (i in seq_len(n_sims)) {
+  
+  east    <- simulate_region_fast(region_slots$East)
+  south   <- simulate_region_fast(region_slots$South)
+  west    <- simulate_region_fast(region_slots$West)
+  midwest <- simulate_region_fast(region_slots$Midwest)
+  
+  # Vectorized accumulation — index by team name, add whole vectors at once
+  adv_mat[east$r32,    "round32"] <- adv_mat[east$r32,    "round32"] + 1L
+  adv_mat[south$r32,   "round32"] <- adv_mat[south$r32,   "round32"] + 1L
+  adv_mat[west$r32,    "round32"] <- adv_mat[west$r32,    "round32"] + 1L
+  adv_mat[midwest$r32, "round32"] <- adv_mat[midwest$r32, "round32"] + 1L
+  
+  adv_mat[east$s16,    "sweet16"] <- adv_mat[east$s16,    "sweet16"] + 1L
+  adv_mat[south$s16,   "sweet16"] <- adv_mat[south$s16,   "sweet16"] + 1L
+  adv_mat[west$s16,    "sweet16"] <- adv_mat[west$s16,    "sweet16"] + 1L
+  adv_mat[midwest$s16, "sweet16"] <- adv_mat[midwest$s16, "sweet16"] + 1L
+  
+  adv_mat[east$e8,    "elite8"] <- adv_mat[east$e8,    "elite8"] + 1L
+  adv_mat[south$e8,   "elite8"] <- adv_mat[south$e8,   "elite8"] + 1L
+  adv_mat[west$e8,    "elite8"] <- adv_mat[west$e8,    "elite8"] + 1L
+  adv_mat[midwest$e8, "elite8"] <- adv_mat[midwest$e8, "elite8"] + 1L
+  
+  adv_mat[east$champ,    "final4"] <- adv_mat[east$champ,    "final4"] + 1L
+  adv_mat[south$champ,   "final4"] <- adv_mat[south$champ,   "final4"] + 1L
+  adv_mat[west$champ,    "final4"] <- adv_mat[west$champ,    "final4"] + 1L
+  adv_mat[midwest$champ, "final4"] <- adv_mat[midwest$champ, "final4"] + 1L
+  
+  # Final Four: East vs West, South vs Midwest
+  ff1 <- sim_game_fast(east$champ,  west$champ)
+  ff2 <- sim_game_fast(south$champ, midwest$champ)
+  adv_mat[ff1, "finals"] <- adv_mat[ff1, "finals"] + 1L
+  adv_mat[ff2, "finals"] <- adv_mat[ff2, "finals"] + 1L
+  
+  champ <- sim_game_fast(ff1, ff2)
+  adv_mat[champ, "champion"] <- adv_mat[champ, "champion"] + 1L
+}
+
+# Convert to probabilities
+prob_mat <- adv_mat / n_sims
+
+results_df <- as.data.frame(prob_mat) %>%
+  rownames_to_column("team") %>%
+  left_join(select(teams, team, seed, region), by = "team") %>%
+  arrange(region, seed) %>%
+  mutate(across(round32:champion, ~ scales::percent(., accuracy = 0.1)))
+```
+
+---
+
+# Simulation Results
+
+## Advancement Probabilities by Team
+
+```{r show-results}
+results_df %>%
+  select(Region = region, Seed = seed, Team = team,
+         `Rd of 32` = round32, `Sweet 16` = sweet16,
+         `Elite 8` = elite8, `Final Four` = final4,
+         `Finals` = finals, Champion = champion) %>%
+  kable(caption = paste0("Advancement Probabilities (", format(n_sims, big.mark = ","), " simulations)")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 12) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+---
+
+## Championship Contenders
+
+```{r champ-contenders}
+champ_df <- as.data.frame(prob_mat) %>%
+  rownames_to_column("team") %>%
+  left_join(select(teams, team, seed, region), by = "team") %>%
+  arrange(desc(champion)) %>%
+  head(16) %>%
+  mutate(
+    champion = scales::percent(champion, accuracy = 0.1),
+    final4   = scales::percent(final4,   accuracy = 0.1),
+    finals   = scales::percent(finals,   accuracy = 0.1)
+  )
+
+champ_df %>%
+  select(Team = team, Seed = seed, Region = region,
+         `Final Four` = final4, Finals = finals, Champion = champion) %>%
+  kable(caption = "Top Championship Contenders") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+## Championship Probability Chart
+
+```{r champ-chart, fig.width=10, fig.height=6}
+as.data.frame(prob_mat) %>%
+  rownames_to_column("team") %>%
+  left_join(select(teams, team, seed, region), by = "team") %>%
+  arrange(desc(champion)) %>%
+  head(20) %>%
+  mutate(team = fct_reorder(team, champion)) %>%
+  ggplot(aes(x = champion, y = team, fill = region)) +
+  geom_col(alpha = 0.85) +
+  geom_text(aes(label = scales::percent(champion, accuracy = 0.1)),
+            hjust = -0.1, size = 3.2) +
+  scale_x_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title    = "Estimated Championship Probability",
+    subtitle = paste0("Based on ", format(n_sims, big.mark = ","), " Monte Carlo simulations"),
+    x        = "P(Champion)",
+    y        = NULL,
+    fill     = "Region",
+    caption  = "Model: Logistic win probability from Adjusted Efficiency Margin (σ = 10)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right")
+```
+
+---
+
+# Most Likely Bracket
+
+The most likely bracket is constructed by selecting the higher-probability team to win each game, working forward from Round 1 through the Championship.
+
+```{r most-likely-bracket}
+# Deterministic winner using em_vec
+predict_winner <- function(t1, t2) {
+  p1 <- 1 / (1 + exp(-(em_vec[t1] - em_vec[t2]) / 10))
+  if (p1 >= 0.5) t1 else t2
+}
+
+predict_region <- function(region_name) {
+  sl <- region_slots[[region_name]]
+  pairs <- get_round64_pairs(teams %>% filter(region == region_name) %>% arrange(slot))
+  
+  r32 <- c(predict_winner(sl[1],  sl[2]),  predict_winner(sl[3],  sl[4]),
+           predict_winner(sl[5],  sl[6]),  predict_winner(sl[7],  sl[8]),
+           predict_winner(sl[9],  sl[10]), predict_winner(sl[11], sl[12]),
+           predict_winner(sl[13], sl[14]), predict_winner(sl[15], sl[16]))
+  s16 <- c(predict_winner(r32[1], r32[2]), predict_winner(r32[3], r32[4]),
+           predict_winner(r32[5], r32[6]), predict_winner(r32[7], r32[8]))
+  e8  <- c(predict_winner(s16[1], s16[2]), predict_winner(s16[3], s16[4]))
+  champ <- predict_winner(e8[1], e8[2])
+  
+  list(round64 = sapply(pairs, paste, collapse = " vs "),
+       round32 = r32, sweet16 = s16, elite8 = e8, champ = champ)
+}
+
+regions  <- c("East", "South", "West", "Midwest")
+predicted <- lapply(regions, predict_region)
+names(predicted) <- regions
+
+ff1 <- predict_winner(predicted$East$champ,  predicted$West$champ)
+ff2 <- predict_winner(predicted$South$champ, predicted$Midwest$champ)
+champion_pick <- predict_winner(ff1, ff2)
+```
+
+## Round of 64
+
+```{r r64-table}
+r64_rows <- do.call(rbind, lapply(regions, function(r) {
+  pairs <- get_round64_pairs(teams %>% filter(region == r) %>% arrange(slot))
+  winners <- sapply(pairs, function(p) predict_winner(p[1], p[2]))
+  probs   <- sapply(pairs, function(p) {
+    round(win_prob(em_vec[p[1]], em_vec[p[2]]) * 100, 1)
+  })
+  tibble(
+    Region     = r,
+    Team1      = sapply(pairs, `[`, 1),
+    Team2      = sapply(pairs, `[`, 2),
+    `P(Team1 Wins)` = paste0(probs, "%"),
+    Predicted_Winner = winners
+  )
+}))
+
+r64_rows %>%
+  kable(caption = "Round of 64 — Predicted Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 11) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+## Round of 32
+
+```{r r32-table}
+r32_rows <- do.call(rbind, lapply(regions, function(r) {
+  prev <- predicted[[r]]$round32
+  pairs_idx <- list(c(1,2), c(3,4), c(5,6), c(7,8))
+  winners <- sapply(pairs_idx, function(p) predict_winner(prev[p[1]], prev[p[2]]))
+  probs   <- sapply(pairs_idx, function(p) {
+    paste0(round(win_prob(em_vec[prev[p[1]]], em_vec[prev[p[2]]]) * 100, 1), "%")
+  })
+  tibble(Region = r, Team1 = prev[sapply(pairs_idx,`[`,1)],
+         Team2 = prev[sapply(pairs_idx,`[`,2)],
+         `P(Team1 Wins)` = probs, Predicted_Winner = winners)
+}))
+
+r32_rows %>%
+  kable(caption = "Round of 32 — Predicted Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 11) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+## Sweet 16
+
+```{r sweet16-table}
+s16_rows <- do.call(rbind, lapply(regions, function(r) {
+  prev <- predicted[[r]]$sweet16
+  winners <- c(predict_winner(prev[1], prev[2]),
+               predict_winner(prev[3], prev[4]))
+  probs <- c(
+    paste0(round(win_prob(em_vec[prev[1]], em_vec[prev[2]]) * 100, 1), "%"),
+    paste0(round(win_prob(em_vec[prev[3]], em_vec[prev[4]]) * 100, 1), "%")
+  )
+  tibble(Region = r,
+         Team1 = prev[c(1,3)], Team2 = prev[c(2,4)],
+         `P(Team1 Wins)` = probs, Predicted_Winner = winners)
+}))
+
+s16_rows %>%
+  kable(caption = "Sweet 16 — Predicted Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 11) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+## Elite Eight
+
+```{r elite8-table}
+e8_rows <- do.call(rbind, lapply(regions, function(r) {
+  prev <- predicted[[r]]$elite8
+  winner <- predict_winner(prev[1], prev[2])
+  p <- paste0(round(win_prob(em_vec[prev[1]], em_vec[prev[2]]) * 100, 1), "%")
+  tibble(Region = r, Team1 = prev[1], Team2 = prev[2], `P(Team1 Wins)` = p, Predicted_Winner = winner)
+}))
+
+e8_rows %>%
+  kable(caption = "Elite Eight — Predicted Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Final Four
+
+```{r ff-table}
+ff_matchups <- tibble(
+  Semifinal = c("East vs West", "South vs Midwest"),
+  Team1     = c(predicted$East$champ,  predicted$South$champ),
+  Team2     = c(predicted$West$champ,  predicted$Midwest$champ),
+  `P(Team1 Wins)` = c(
+    paste0(round(win_prob(em_vec[predicted$East$champ],  em_vec[predicted$West$champ])  * 100, 1), "%"),
+    paste0(round(win_prob(em_vec[predicted$South$champ], em_vec[predicted$Midwest$champ]) * 100, 1), "%")
+  ),
+  Predicted_Winner = c(ff1, ff2)
+)
+
+ff_matchups %>%
+  kable(caption = "Final Four — Predicted Results") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Championship
+
+```{r championship-table}
+champ_p <- round(win_prob(em_vec[ff1], em_vec[ff2]) * 100, 1)
+
+tibble(
+  Team1 = ff1, Team2 = ff2,
+  `P(Team1 Wins)` = paste0(champ_p, "%"),
+  `🏆 Predicted Champion` = champion_pick
+) %>%
+  kable(caption = "National Championship Game") %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+---
+
+# Probabilistic Bracket
+
+The deterministic bracket above always picks the favorite, which underrepresents upsets relative to historical rates. A more realistic — and strategically useful — approach constructs a bracket by sampling game outcomes according to their actual win probabilities. Under this method a 12-seed with a 35% chance of winning gets picked 35% of the time, naturally producing a bracket that reflects the true uncertainty of the tournament.
+
+```{r probabilistic-bracket}
+# Build one bracket by sampling each game probabilistically
+prob_game <- function(t1, t2) {
+  p1 <- 1 / (1 + exp(-(em_vec[t1] - em_vec[t2]) / 10))
+  if (runif(1) < p1) t1 else t2
+}
+
+prob_region <- function(region_name) {
+  sl <- region_slots[[region_name]]
+  r32 <- c(prob_game(sl[1],  sl[2]),  prob_game(sl[3],  sl[4]),
+           prob_game(sl[5],  sl[6]),  prob_game(sl[7],  sl[8]),
+           prob_game(sl[9],  sl[10]), prob_game(sl[11], sl[12]),
+           prob_game(sl[13], sl[14]), prob_game(sl[15], sl[16]))
+  s16 <- c(prob_game(r32[1], r32[2]), prob_game(r32[3], r32[4]),
+           prob_game(r32[5], r32[6]), prob_game(r32[7], r32[8]))
+  e8  <- c(prob_game(s16[1], s16[2]), prob_game(s16[3], s16[4]))
+  champ <- prob_game(e8[1], e8[2])
+  list(round32 = r32, sweet16 = s16, elite8 = e8, champ = champ)
+}
+
+set.seed(42)
+pb <- lapply(regions, prob_region)
+names(pb) <- regions
+
+pb_ff1   <- prob_game(pb$East$champ,  pb$West$champ)
+pb_ff2   <- prob_game(pb$South$champ, pb$Midwest$champ)
+pb_champ <- prob_game(pb_ff1, pb_ff2)
+```
+
+## Round of 64
+
+```{r pb-r64-table}
+pb_r64_rows <- do.call(rbind, lapply(regions, function(r) {
+  sl    <- region_slots[[r]]
+  pairs <- get_round64_pairs(teams %>% filter(region == r) %>% arrange(slot))
+  # winners are the r32 entrants — show who they beat
+  winners <- pb[[r]]$round32
+  probs <- sapply(pairs, function(p) {
+    paste0(round(win_prob(em_vec[p[1]], em_vec[p[2]]) * 100, 1), "%")
+  })
+  tibble(
+    Region  = r,
+    Team1   = sapply(pairs, `[`, 1),
+    Team2   = sapply(pairs, `[`, 2),
+    `P(Team1 Wins)` = probs,
+    Predicted_Winner = winners
+  )
+}))
+
+pb_r64_rows %>%
+  kable(caption = "Probabilistic Bracket — Round of 64") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 11) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+## Round of 32
+
+```{r pb-r32-table}
+pb_r32_rows <- do.call(rbind, lapply(regions, function(r) {
+  prev      <- pb[[r]]$round32
+  pairs_idx <- list(c(1,2), c(3,4), c(5,6), c(7,8))
+  winners   <- pb[[r]]$sweet16
+  probs     <- sapply(pairs_idx, function(p) {
+    paste0(round(win_prob(em_vec[prev[p[1]]], em_vec[prev[p[2]]]) * 100, 1), "%")
+  })
+  tibble(Region = r,
+         Team1  = prev[sapply(pairs_idx, `[`, 1)],
+         Team2  = prev[sapply(pairs_idx, `[`, 2)],
+         `P(Team1 Wins)` = probs,
+         Predicted_Winner = winners)
+}))
+
+pb_r32_rows %>%
+  kable(caption = "Probabilistic Bracket — Round of 32") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 11) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+## Sweet 16
+
+```{r pb-s16-table}
+pb_s16_rows <- do.call(rbind, lapply(regions, function(r) {
+  prev    <- pb[[r]]$sweet16
+  winners <- pb[[r]]$elite8
+  probs   <- c(
+    paste0(round(win_prob(em_vec[prev[1]], em_vec[prev[2]]) * 100, 1), "%"),
+    paste0(round(win_prob(em_vec[prev[3]], em_vec[prev[4]]) * 100, 1), "%")
+  )
+  tibble(Region = r,
+         Team1  = prev[c(1, 3)], Team2 = prev[c(2, 4)],
+         `P(Team1 Wins)` = probs,
+         Predicted_Winner = winners)
+}))
+
+pb_s16_rows %>%
+  kable(caption = "Probabilistic Bracket — Sweet 16") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), font_size = 11) %>%
+  collapse_rows(columns = 1, valign = "top")
+```
+
+## Elite Eight
+
+```{r pb-e8-table}
+pb_e8_rows <- do.call(rbind, lapply(regions, function(r) {
+  prev   <- pb[[r]]$elite8
+  winner <- pb[[r]]$champ
+  p      <- paste0(round(win_prob(em_vec[prev[1]], em_vec[prev[2]]) * 100, 1), "%")
+  tibble(Region = r, Team1 = prev[1], Team2 = prev[2],
+         `P(Team1 Wins)` = p, Predicted_Winner = winner)
+}))
+
+pb_e8_rows %>%
+  kable(caption = "Probabilistic Bracket — Elite Eight") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Final Four
+
+```{r pb-ff-table}
+pb_ff_matchups <- tibble(
+  Semifinal = c("East vs West", "South vs Midwest"),
+  Team1     = c(pb$East$champ,  pb$South$champ),
+  Team2     = c(pb$West$champ,  pb$Midwest$champ),
+  `P(Team1 Wins)` = c(
+    paste0(round(win_prob(em_vec[pb$East$champ],  em_vec[pb$West$champ])  * 100, 1), "%"),
+    paste0(round(win_prob(em_vec[pb$South$champ], em_vec[pb$Midwest$champ]) * 100, 1), "%")
+  ),
+  Predicted_Winner = c(pb_ff1, pb_ff2)
+)
+
+pb_ff_matchups %>%
+  kable(caption = "Probabilistic Bracket — Final Four") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Championship
+
+```{r pb-champ-table}
+pb_champ_p <- round(win_prob(em_vec[pb_ff1], em_vec[pb_ff2]) * 100, 1)
+
+tibble(
+  Team1 = pb_ff1, Team2 = pb_ff2,
+  `P(Team1 Wins)` = paste0(pb_champ_p, "%"),
+  `🏆 Predicted Champion` = pb_champ
+) %>%
+  kable(caption = "Probabilistic Bracket — National Championship") %>%
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE)
+```
+
+---
+
+# Game Theory: Strategic Upset Selection
+
+Using the expected value framework from the document:
+
+$$EV = P \times V \times (1 - O)$$
+
+where $P$ = probability of upset, $V$ = point value of the round, $O$ = fraction of brackets selecting the upset.
+
+For this analysis we approximate ownership using seed-based priors (popular upsets like 12-over-5 have ~50% ownership; unlikely ones are much lower).
+
+```{r upset-ev}
+# Round of 64 upset opportunities
+round_points <- c(`Round of 64` = 1, `Round of 32` = 2, `Sweet 16` = 4,
+                  `Elite Eight` = 8, `Final Four` = 16, Championship = 32)
+
+# Ownership prior by seed of lower seed winning
+ownership_prior <- c(`16`=0.02, `15`=0.05, `14`=0.10, `13`=0.15,
+                     `12`=0.48, `11`=0.45, `10`=0.35, `9`=0.45)
+
+r64_pairs_all <- do.call(c, lapply(regions, function(r) {
+  get_round64_pairs(teams %>% filter(region == r) %>% arrange(slot))
+}))
+
+ev_rows <- lapply(r64_pairs_all, function(p) {
+  fav   <- p[1]; dog <- p[2]
+  p_upset <- 1 - win_prob(em_vec[fav], em_vec[dog])
+  dog_seed <- teams$seed[teams$team == dog]
+  own <- ownership_prior[as.character(dog_seed)]
+  if (is.na(own)) own <- 0.20
+  ev <- round(p_upset * 1 * (1 - own), 3)
+  tibble(Favorite = fav, Underdog = dog,
+         `P(Upset)` = round(p_upset, 3),
+         `Ownership (est.)` = own,
+         `EV (Round of 64)` = ev)
+}) %>% bind_rows() %>% arrange(desc(`EV (Round of 64)`))
+
+ev_rows %>%
+  head(15) %>%
+  kable(caption = "Top 15 Round of 64 Upset Opportunities by Expected Value") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# Summary
+
+```{r summary-box}
+# Top 5 champion picks
+top5 <- as.data.frame(prob_mat) %>%
+  rownames_to_column("team") %>%
+  left_join(select(teams, team, seed, region), by = "team") %>%
+  arrange(desc(champion)) %>%
+  head(5)
+
+cat("=== PREDICTED BRACKET SUMMARY ===\n\n")
+
+cat("── DETERMINISTIC BRACKET (always pick the favorite) ──\n")
+cat("FINAL FOUR:\n")
+for (r in regions) cat(" •", predicted[[r]]$champ, "\n")
+cat("\nCHAMPIONSHIP GAME:\n •", ff1, "vs.", ff2, "\n")
+cat("PREDICTED CHAMPION:\n •", champion_pick, "\n\n")
+
+cat("── PROBABILISTIC BRACKET (sample by win probability) ──\n")
+cat("FINAL FOUR:\n")
+for (r in regions) cat(" •", pb[[r]]$champ, "\n")
+cat("\nCHAMPIONSHIP GAME:\n •", pb_ff1, "vs.", pb_ff2, "\n")
+cat("PREDICTED CHAMPION:\n •", pb_champ, "\n\n")
+
+cat("── TOP CHAMPIONSHIP PROBABILITIES (from simulation) ──\n")
+for (i in 1:5) {
+  cat(sprintf(" %d. %s (%s, Seed %d): %.1f%%\n",
+      i, top5$team[i], top5$region[i], top5$seed[i], top5$champion[i]*100))
+}
+```
